@@ -16,6 +16,11 @@ from app.core.functions import get_coder_tools
 from app.core.llm.llm import LLM
 from app.core.prompts.shared import get_reflection_prompt
 from app.core.prompts.coder import get_coder_prompt
+from app.core.structured_output import (
+    configured_output_budget,
+    expanded_output_budget,
+    response_was_truncated,
+)
 from app.schemas.A2A import CoderToWriter
 from app.schemas.response import InterpreterMessage, SystemMessage
 from app.services.redis_manager import redis_manager
@@ -132,6 +137,8 @@ class CoderAgent(Agent):
 
             try:
                 response = await self._call_model(tools)
+            except CoderAgentRunError:
+                raise
             except Exception as exc:
                 # LLM.chat 已拥有网络重试和备用模型切换权；这里再次重试会把
                 # 4 次网关请求乘成 12 次，因此只负责转换为可续跑的阶段错误。
@@ -232,12 +239,63 @@ class CoderAgent(Agent):
     async def _call_model(
         self, tools: list[dict], tool_choice: str = "auto"
     ) -> Any:
-        return await self._chat(
-            history=self.chat_history,
-            tools=tools,
-            tool_choice=tool_choice,
-            agent_name=self.__class__.__name__,
-        )
+        """只返回完整且可执行的响应，协议重试最多三次。"""
+        budget = configured_output_budget(self.model)
+        for attempt in range(3):
+            response = await self._chat(
+                history=self.chat_history,
+                tools=tools,
+                tool_choice=tool_choice,
+                agent_name=self.__class__.__name__,
+                max_tokens=budget,
+            )
+            error = ""
+            if response_was_truncated(response, budget):
+                error = "模型输出达到上限被截断"
+                budget = expanded_output_budget(budget)
+            elif response.tool_calls:
+                if len(response.tool_calls) != 1 or not tools:
+                    error = "当前响应必须只包含一个允许的工具调用"
+                else:
+                    try:
+                        self._validated_code(response.tool_calls[0])
+                    except ValueError as exc:
+                        error = str(exc)
+            elif not isinstance(response.content, str) or not response.content.strip():
+                error = "模型未返回代码或有效总结"
+            if not error:
+                return response
+            logger.warning(f"代码手响应校验失败 ({attempt + 1}/3): {error}")
+            if attempt == 2:
+                raise CoderAgentRunError(
+                    f"代码手连续 3 次响应不完整或参数无效：{error}；可从当前节点续跑"
+                )
+            # 不把不完整工具调用放入历史，避免悬空 tool_call 或执行半段代码。
+            await self.append_chat_history({
+                "role": "user",
+                "content": (
+                    f"上次响应未执行：{error}。请缩短输出并完整重发。"
+                    + ('只调用一次 execute_code，参数为含非空字符串 code 的 JSON 对象。'
+                       if tools else "工具已禁用，请基于已有结果给出完整总结。")
+                ),
+            })
+            await publish_activity(self.task_id, "模型响应不完整，正在重新生成", category="repair")
+
+    @staticmethod
+    def _validated_code(tool_call: Any) -> str:
+        """校验不可信工具参数，避免缺字段或错误类型进入执行器。"""
+        if tool_call.name != "execute_code":
+            raise ValueError("只允许 execute_code 工具")
+        if not isinstance(tool_call.arguments, str) or len(tool_call.arguments) > 1_000_000:
+            raise ValueError("工具参数必须为不超过 1000000 字符的 JSON 字符串")
+        try:
+            arguments = json.loads(tool_call.arguments)
+        except (ValueError, RecursionError) as exc:
+            raise ValueError("工具参数不是有效 JSON") from exc
+        code = arguments.get("code") if isinstance(arguments, dict) else None
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("execute_code 缺少非空字符串 code 参数")
+        return code
 
     async def _finalize_at_execution_limit(
         self,
@@ -268,6 +326,8 @@ class CoderAgent(Agent):
         )
         try:
             response = await self._call_model([], tool_choice="none")
+        except CoderAgentRunError:
+            raise
         except Exception as exc:
             message = (
                 f"代码手整理已有结果时模型服务不可用：{exc}。"
@@ -304,6 +364,7 @@ class CoderAgent(Agent):
             ``None`` 表示非 execute_code 调用（忽略）。
         """
         tool_call = response.tool_calls[0]
+        code = self._validated_code(tool_call)
         if tool_call.name != "execute_code":
             logger.info(f"忽略非代码工具调用: {tool_call.name}")
             return None
@@ -318,7 +379,6 @@ class CoderAgent(Agent):
         logger.info(f"调用工具: {tool_call.name}")
         await self._notify(f"代码手调用{tool_call.name}工具", "info")
 
-        code = json.loads(tool_call.arguments)["code"]
         self._last_code = code
         await redis_manager.publish_message(
             self.task_id,
