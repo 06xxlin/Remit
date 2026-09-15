@@ -111,6 +111,23 @@ class WorkflowApprovalRequired(RuntimeError):
         super().__init__(f"等待人工审核：{approval.get('node_label', '')}")
 
 
+class WorkflowPausedForReview(RuntimeError):
+    """节点质量门未通过、HIL 已关闭，工作流不应被强制标 failed。
+
+    调用方已把当前节点和原因写入 pending_approval，并把 status 改为
+    ``awaiting_approval``。任务在等待用户回到页面：
+    - 批准 → 携带现有不完整产物继续；
+    - 退回 → 带着用户意见从该节点重新跑；
+    - 续跑 → 从该节点起重新生成产物。
+    """
+
+    def __init__(self, approval: dict[str, Any]):
+        self.approval = approval
+        super().__init__(
+            f"质量门未通过，已挂起等待人工裁决：{approval.get('node_label', '')}"
+        )
+
+
 def _build_manual_execution_review(
     *,
     key: str,
@@ -493,16 +510,33 @@ class RemitWorkFlow(WorkFlow):
         allow_incomplete: bool = False,
         explain: dict[str, Any] | None = None,
     ) -> None:
-        """按 HIL 配置建立人工闸门；自动模式绝不放行不完整产物。"""
+        """按 HIL 配置建立人工闸门。
+
+        自动模式（HIL 关闭）下，未完成的节点必须挂起等待人工裁决，
+        而不是被强制标 failed 让用户看不到下一步在哪里。
+        """
         if self.checkpoint is None:
             raise RuntimeError("workflow checkpoint is not initialized")
         checkpoint_key = self._hil_checkpoint_key(node_id)
         if not self._hil_enabled_for(node_id):
             if allow_incomplete:
-                raise RuntimeError(
-                    f"{node_id} 自动质量门未通过，且人工审核已关闭；"
-                    "任务已明确失败，不会把不完整产物自动放行。"
+                # 不再抛 RuntimeError 把任务推入 failed：把它落到
+                # ``awaiting_approval`` 并挂起 pending_approval，让用户
+                # 在页面上批准/退回/续跑，保留对不完整产物的处置权。
+                logger.warning(
+                    f"人工审核已关闭且 {node_id}（{checkpoint_key}）质量门"
+                    "未通过；挂起等待人工裁决而非作废任务"
                 )
+                pending = self.checkpoint.request_approval(
+                    state,
+                    node_id,
+                    summary=summary,
+                    artifacts=artifacts,
+                    quality_report=quality_report,
+                    allow_incomplete=True,
+                    explain=explain,
+                )
+                raise WorkflowPausedForReview(pending)
             logger.info(f"人工审核已关闭，节点 {node_id}（{checkpoint_key}）自动继续")
             return None
 
@@ -537,7 +571,14 @@ class RemitWorkFlow(WorkFlow):
     def _resolve_pending_approval_on_resume(
         self, state: dict[str, Any]
     ) -> dict[str, Any]:
-        """让关闭 HIL 后恢复的旧任务不再困在历史审核状态。"""
+        """让关闭 HIL 后恢复的旧任务不再困在历史审核状态。
+
+        历史 pending 来自质量门失败且 HIL 已关闭时，把任务挂回
+        ``awaiting_approval`` 让用户接管，而不是抛 RuntimeError 把任务推到
+        ``failed``。这条路径仅在 ``run_modeling_task_async`` 重新触发流程
+        时生效；用户已经主动通过 UI 进入项目的场景由 resume_task 直接读取
+        pending_approval，不会走这里。
+        """
         if self.checkpoint is None:
             raise RuntimeError("workflow checkpoint is not initialized")
         pending = self.checkpoint.pending_approval(state)
@@ -552,10 +593,13 @@ class RemitWorkFlow(WorkFlow):
             state.get("completed_nodes", [])
         )
         if is_incomplete:
-            raise RuntimeError(
-                f"{node_id} 的历史审核来自未通过的质量门，且人工审核已关闭；"
-                "任务已明确失败，不会把不完整产物自动放行。"
+            # 复用现有 pending_approval 即可，状态已经是 awaiting_approval。
+            # 调用方捕获 WorkflowPausedForReview 完成页面通知与状态稳定化。
+            logger.warning(
+                f"{node_id} 历史审核来自未通过质量门且 HIL 已关闭；"
+                "挂起等待人工裁决而非作废任务"
             )
+            raise WorkflowPausedForReview(pending)
 
         logger.info(f"人工审核已关闭，自动释放历史审核节点 {node_id}")
         return self.checkpoint.auto_continue(
