@@ -117,6 +117,10 @@ class CoderAgent(Agent):
         last_source = ""
 
         while True:
+            if self.current_code_executions >= self.max_code_executions:
+                return await self._finalize_at_execution_limit(
+                    interpreter, subtask_title
+                )
             self._enforce_budget(retry_count, last_error, last_source)
             self.current_chat_turns += 1
             await self._inject_user_notes()
@@ -225,12 +229,67 @@ class CoderAgent(Agent):
             SystemMessage(content=content, type=level),  # type: ignore[arg-type]
         )
 
-    async def _call_model(self, tools: list[dict]) -> Any:
+    async def _call_model(
+        self, tools: list[dict], tool_choice: str = "auto"
+    ) -> Any:
         return await self._chat(
             history=self.chat_history,
             tools=tools,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             agent_name=self.__class__.__name__,
+        )
+
+    async def _finalize_at_execution_limit(
+        self,
+        interpreter: BaseCodeInterpreter,
+        subtask_title: str,
+    ) -> CoderToWriter:
+        """达到执行上限后，基于已有结果完成总结而不再运行代码。"""
+        logger.warning(
+            f"代码执行已达到单节点上限 {self.max_code_executions}，"
+            "禁用工具并要求模型收口"
+        )
+        await self._inject_user_notes()
+        await self.append_chat_history(
+            {
+                "role": "user",
+                "content": (
+                    f"你已用完本节点 {self.max_code_executions} 次代码执行预算。"
+                    "禁止继续调用工具。请仅依据已有代码输出和已生成文件，"
+                    "立即给出本节点的最终结论；明确关键结果、产物路径以及"
+                    "仍未完成或无法验证的事项，不得虚构结果。"
+                ),
+            }
+        )
+        await publish_activity(
+            self.task_id,
+            f"{subtask_title} 已达到代码执行上限，正在整理已有结果",
+            category="gate",
+        )
+        try:
+            response = await self._call_model([], tool_choice="none")
+        except Exception as exc:
+            message = (
+                f"代码手整理已有结果时模型服务不可用：{exc}。"
+                "已生成文件均已保留，可从当前节点续跑。"
+            )
+            logger.error(message)
+            raise CoderAgentUnavailableError(message) from exc
+
+        if response.tool_calls:
+            raise CoderAgentBudgetError(
+                f"代码手达到单节点 {self.max_code_executions} 次代码执行上限后"
+                "仍请求执行工具；已保留当前产物和 checkpoint。"
+            )
+
+        await publish_activity(
+            self.task_id,
+            f"{subtask_title} 已基于现有结果完成整理，进入质量检查",
+            category="gate",
+        )
+        return CoderToWriter(
+            code_response=response.content,
+            created_images=await interpreter.get_created_images(subtask_title),
         )
 
     _last_code: str = ""
