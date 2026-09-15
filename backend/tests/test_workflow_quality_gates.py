@@ -9,6 +9,7 @@ from pathlib import Path
 
 from app.core.deliverable_contract import (
     DeliverableValidationError,
+    _validate_type_specific,
     build_question_contract,
     build_stage_contract,
     validate_final_paper,
@@ -17,6 +18,23 @@ from app.core.deliverable_contract import (
 
 
 class WorkflowQualityGateTests(unittest.TestCase):
+    def test_eda_flag_error_names_field_and_expected_type(self) -> None:
+        for invalid in ("同一晶圆的两次测量", [], {}, 1, False, None):
+            with self.subTest(invalid=invalid):
+                values = {
+                    "raw_rows": 10,
+                    "cleaned_rows": 9,
+                    "missingness_checked": True,
+                    "duplicates_checked": True,
+                    "outliers_assessed": True,
+                    "independent_unit_identified": invalid,
+                }
+                with self.assertRaisesRegex(
+                    DeliverableValidationError,
+                    "type_specific.independent_unit_identified.*true.*not_applicable",
+                ):
+                    _validate_type_specific(values, build_stage_contract("eda"))
+
     @staticmethod
     def _base_report(problem_type: str) -> dict:
         return {
