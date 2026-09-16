@@ -1395,8 +1395,33 @@ class RemitWorkFlow(WorkFlow):
             )
         contract = value.get("contract")
         recovered_gate_report = None
-        if contract is not None and find_reusable_stage_artifacts(
-            self.work_dir, contract
+        repair_execution_limit: int | None = None
+        reusable_stage_artifacts = (
+            find_reusable_stage_artifacts(self.work_dir, contract)
+            if contract is not None
+            else []
+        )
+        quality_report_exists = bool(
+            contract is not None
+            and (Path(self.work_dir) / contract.quality_filename).is_file()
+        )
+        incomplete_revision = bool(
+            revision_feedback
+            and any(
+                isinstance(item, dict)
+                and item.get("decision") == "revise"
+                and item.get("allow_incomplete") is True
+                and str(
+                    item.get("revision_target_node_id")
+                    or item.get("node_id")
+                    or ""
+                )
+                == node_id
+                for item in reversed(state.get("approval_history", []))
+            )
+        )
+        if contract is not None and (
+            reusable_stage_artifacts or quality_report_exists or incomplete_revision
         ):
             try:
                 recovered_report = validate_question_deliverables(
@@ -1423,10 +1448,21 @@ class RemitWorkFlow(WorkFlow):
                     ),
                 )
             except DeliverableValidationError as interrupted_error:
+                repair_execution_limit = 2
+                repair_prompt = build_repair_prompt(
+                    contract, interrupted_error, self.work_dir
+                )
                 coder_prompt = (
-                    f"{coder_prompt}\n\n"
-                    "【检测到上次中断留下的真实计算产物，优先执行收尾恢复】\n"
-                    f"{build_repair_prompt(contract, interrupted_error, self.work_dir)}"
+                    "【断点返修模式：本轮只修复现有产物】\n"
+                    "现有计算证据必须保留。第一轮先读取质量报告和报错涉及的文件，"
+                    "只修改门禁明确指出的问题并立即回读验证；禁止重新探索原始数据、"
+                    "安装依赖、重跑与报错无关的模型或重建已经存在的图表。\n"
+                    + (
+                        f"\n【人工审核退回意见，优先级最高】\n{revision_feedback}\n"
+                        if revision_feedback
+                        else ""
+                    )
+                    + f"\n{repair_prompt}"
                 )
         coder_response: CoderToWriter | None = None
         gate_report = None
@@ -1522,6 +1558,7 @@ class RemitWorkFlow(WorkFlow):
                 coder_response = await coder_agent.run(
                     prompt=coder_prompt,
                     subtask_title=key,
+                    max_code_executions=repair_execution_limit,
                 )
                 await publish_activity(
                     self.task_id,
@@ -1632,6 +1669,10 @@ class RemitWorkFlow(WorkFlow):
                             revision_plan=revision_plan.model_dump(mode="json"),
                             contract_prompt=contract.prompt_block(),
                         )
+                        # 换模是一次新的真实求解，不是只修 JSON/CSV 的格式返修；
+                        # 必须恢复完整执行预算，否则新方案会在两次工具调用后再次
+                        # 被截断，永远无法形成可比较的模型证据。
+                        repair_execution_limit = None
                         await redis_manager.publish_message(
                             self.task_id,
                             SystemMessage(
@@ -1655,6 +1696,7 @@ class RemitWorkFlow(WorkFlow):
                         coder_prompt = build_repair_prompt(
                             contract, error, self.work_dir
                         )
+                        repair_execution_limit = 2
                     continue
 
             if gate_report.manual_review_required:
@@ -1777,6 +1819,9 @@ class RemitWorkFlow(WorkFlow):
                     revision_plan=revision_plan.model_dump(mode="json"),
                     contract_prompt=contract.prompt_block(),
                 )
+                # 通过格式门禁后的建模手 refine 同样代表换模重算，不能沿用
+                # 断点格式返修的两次执行上限。
+                repair_execution_limit = None
                 await redis_manager.publish_message(
                     self.task_id,
                     SystemMessage(

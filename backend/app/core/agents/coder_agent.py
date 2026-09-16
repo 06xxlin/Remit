@@ -81,12 +81,19 @@ class CoderAgent(Agent):
 
     # ---- 主循环 ----
 
-    async def run(self, prompt: str, subtask_title: str) -> CoderToWriter:  # type: ignore[reportIncompatibleMethodOverride]
+    async def run(  # type: ignore[reportIncompatibleMethodOverride]
+        self,
+        prompt: str,
+        subtask_title: str,
+        max_code_executions: int | None = None,
+    ) -> CoderToWriter:
         """推进一个编码子任务直到模型宣告完成。
 
         Args:
             prompt: 子任务说明。
             subtask_title: 小节标题，用于 notebook 分段与输出归集。
+            max_code_executions: 本轮可选的更小执行上限，用于只需修补现有
+                产物的断点续跑；不能突破 Agent 的全局安全上限。
 
         Returns:
             编码结论与产出图片清单。
@@ -105,6 +112,9 @@ class CoderAgent(Agent):
         # 预算按单次调用计，跨小问 / 修复尝试不共享。
         self.current_chat_turns = 0
         self.current_code_executions = 0
+        execution_limit = self.max_code_executions
+        if max_code_executions is not None:
+            execution_limit = max(1, min(max_code_executions, execution_limit))
         interpreter.add_section(subtask_title)
         interpreter.notebook_serializer.add_markdown_segmentation_to_notebook(
             "以下代码与输出属于该工作流节点，可按此标题在 notebook 中定位。",
@@ -122,9 +132,9 @@ class CoderAgent(Agent):
         last_source = ""
 
         while True:
-            if self.current_code_executions >= self.max_code_executions:
+            if self.current_code_executions >= execution_limit:
                 return await self._finalize_at_execution_limit(
-                    interpreter, subtask_title
+                    interpreter, subtask_title, execution_limit
                 )
             self._enforce_budget(retry_count, last_error, last_source)
             self.current_chat_turns += 1
@@ -165,6 +175,27 @@ class CoderAgent(Agent):
             outcome = await self._handle_tool_call(response, interpreter)
             if outcome == "ok":
                 retry_count, last_error, last_source = 0, "", ""
+                remaining_executions = (
+                    execution_limit - self.current_code_executions
+                )
+                if 0 < remaining_executions <= 2:
+                    # 不能等预算归零后才要求总结：质量报告等契约文件必须由
+                    # execute_code 真正落盘。提前保留最后一到两次调用，让模型
+                    # 把当前内核中的真实中间结果持久化并回读，而不是在最终文本
+                    # 中“算完了”却因缺文件再次进入整轮重试。
+                    await self.append_chat_history(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"本轮只剩 {remaining_executions} 次 execute_code。"
+                                "停止新增探索和改进模型；下一次执行必须优先把当前"
+                                "内核中的真实结果写入提示中要求的全部必需交付文件，"
+                                "并在同一次执行末尾回读、检查文件存在性与 JSON/CSV"
+                                "结构。若证据不足，按协议如实写失败或人工复核状态，"
+                                "不得把落盘动作留到预算耗尽后的文字总结。"
+                            ),
+                        }
+                    )
                 continue
             if outcome is not None:
                 # outcome 是 (错误详情)，走反思路径
@@ -301,10 +332,11 @@ class CoderAgent(Agent):
         self,
         interpreter: BaseCodeInterpreter,
         subtask_title: str,
+        execution_limit: int,
     ) -> CoderToWriter:
         """达到执行上限后，基于已有结果完成总结而不再运行代码。"""
         logger.warning(
-            f"代码执行已达到单节点上限 {self.max_code_executions}，"
+            f"代码执行已达到本轮上限 {execution_limit}，"
             "禁用工具并要求模型收口"
         )
         await self._inject_user_notes()
@@ -312,7 +344,7 @@ class CoderAgent(Agent):
             {
                 "role": "user",
                 "content": (
-                    f"你已用完本节点 {self.max_code_executions} 次代码执行预算。"
+                    f"你已用完本轮 {execution_limit} 次代码执行预算。"
                     "禁止继续调用工具。请仅依据已有代码输出和已生成文件，"
                     "立即给出本节点的最终结论；明确关键结果、产物路径以及"
                     "仍未完成或无法验证的事项，不得虚构结果。"
@@ -338,7 +370,7 @@ class CoderAgent(Agent):
 
         if response.tool_calls:
             raise CoderAgentBudgetError(
-                f"代码手达到单节点 {self.max_code_executions} 次代码执行上限后"
+                f"代码手达到本轮 {execution_limit} 次代码执行上限后"
                 "仍请求执行工具；已保留当前产物和 checkpoint。"
             )
 

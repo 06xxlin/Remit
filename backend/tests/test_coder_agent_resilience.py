@@ -206,6 +206,58 @@ class CoderAgentResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._chat.await_args_list[-1].kwargs["tools"], [])
         self.assertEqual(agent._chat.await_args_list[-1].kwargs["tool_choice"], "none")
 
+    async def test_run_can_apply_a_smaller_repair_execution_budget(self) -> None:
+        agent = _make_agent(max_code_executions=8, max_chat_turns=10)
+
+        async def respond(**kwargs):
+            if kwargs["tools"]:
+                return _tool_response("repair-call", "inspect_or_repair()")
+            return StandardResponse(content="repair budget exhausted")
+
+        agent._chat = AsyncMock(side_effect=respond)
+        agent.code_interpreter.execute_code.return_value = ("ok", False, "")
+
+        with patch(
+            "app.core.agents.coder_agent.redis_manager.publish_message",
+            new=AsyncMock(),
+        ):
+            result = await agent.run(
+                "repair only",
+                "ques1",
+                max_code_executions=2,
+            )
+
+        self.assertEqual(result.code_response, "repair budget exhausted")
+        self.assertEqual(agent.code_interpreter.execute_code.await_count, 2)
+        self.assertEqual(agent.max_code_executions, 8)
+
+    async def test_warns_model_to_persist_contract_before_last_execution(self) -> None:
+        agent = _make_agent(max_code_executions=3, max_chat_turns=10)
+        histories: list[list[dict]] = []
+
+        async def respond(**kwargs):
+            histories.append([dict(item) for item in kwargs["history"]])
+            if len(histories) <= 2:
+                return _tool_response(f"call-{len(histories)}", "work()")
+            return StandardResponse(content="files persisted")
+
+        agent._chat = AsyncMock(side_effect=respond)
+        agent.code_interpreter.execute_code.return_value = ("ok", False, "")
+
+        with patch(
+            "app.core.agents.coder_agent.redis_manager.publish_message",
+            new=AsyncMock(),
+        ):
+            result = await agent.run("solve and persist", "ques1")
+
+        self.assertEqual(result.code_response, "files persisted")
+        self.assertTrue(
+            any(
+                "下一次执行必须优先" in str(item.get("content", ""))
+                for item in histories[1]
+            )
+        )
+
     async def test_each_subtask_starts_with_fresh_model_history(self) -> None:
         agent = _make_agent()
         captured: list[list[dict]] = []

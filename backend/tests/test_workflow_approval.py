@@ -245,6 +245,49 @@ class WorkflowApprovalTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(revised["revision_counts"]["modeler"], 1)
 
+    async def test_revision_of_incomplete_solver_preserves_repair_artifacts(
+        self,
+    ) -> None:
+        """质量门失败后的人工返修应复用落盘证据，而不是从头求解。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = WorkflowCheckpoint(root)
+            state = checkpoint.initialize(self._problem())
+            self._completed_node(checkpoint, state)
+            state["modeler_response"] = {
+                "questions_solution": {"ques1": "回归"}
+            }
+            checkpoint.complete_node(state, "modeler")
+            checkpoint.start_node(state, "solve:eda")
+            report_path = root / "eda_quality_report.json"
+            artifact_path = root / "eda_clean.csv"
+            report_path.write_text(
+                '{"status":"manual_review","artifacts":["eda_clean.csv"]}',
+                encoding="utf-8",
+            )
+            artifact_path.write_text("x\n1\n", encoding="utf-8")
+            pending = checkpoint.request_approval(
+                state,
+                "solve:eda",
+                summary="质量门未通过",
+                artifacts=["eda_quality_report.json", "eda_clean.csv"],
+                allow_incomplete=True,
+            )
+
+            revised = checkpoint.request_revision(
+                state,
+                pending["checkpoint_id"],
+                "只修复质量报告中的字段类型。",
+            )
+
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(artifact_path.is_file())
+            self.assertEqual(revised["current_node"], "solve:eda")
+            self.assertEqual(
+                checkpoint.consume_revision_feedback(revised, "solve:eda"),
+                "只修复质量报告中的字段类型。",
+            )
+
     async def test_reviewer_can_return_to_an_earlier_approved_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = WorkflowCheckpoint(tmp)

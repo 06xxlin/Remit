@@ -80,6 +80,7 @@ _PREDICTIVE_PROBLEM_TYPES = frozenset(
 )
 _MODEL_QUALITY_PROBLEM_TYPES = frozenset(
     {
+        "analysis",
         "regression",
         "classification",
         "system_identification",
@@ -305,7 +306,9 @@ class QuestionDeliverableContract:
             + """
 
 质量报告的 `type_specific` 必须包含：
-`evidence_checks, uncertainty_reported, effect_size_reported`。至少两项独立证据检查，并报告不确定性和效应量。
+`evidence_checks, uncertainty_reported, effect_size_reported`。
+- `evidence_checks` 必须是已完成独立证据检查数量的 JSON 数字（至少 2），不得写数组或对象；检查明细另存 `evidence_checks_detail`。
+- `uncertainty_reported` 和 `effect_size_reported` 必须是 JSON 布尔值 `true`，不得写对象；具体数值明细可分别另存 `uncertainty` 和 `effect_size`。
 """
         )
 
@@ -1936,8 +1939,9 @@ def build_repair_prompt(
 - 已存在的必需文件：{", ".join(existing) if existing else "无"}
 - 本次必须一次性补齐的文件：{", ".join(missing) if missing else "无"}
 - 可复用的真实中间产物：{", ".join(reusable) if reusable else "无"}
-先读取并核对已有 CSV/MAT/JSON 中的真实结果。已有证据足够时禁止无意义地重跑耗时模型；
-但不得臆造、手填或篡改指标。最后一次 execute_code 必须生成全部缺失文件，逐个读取验证并打印检查结果。
+不要枚举目录、统计文件数量或重新探索原始数据。第一次 execute_code 只读取报错直接涉及的最少文件，
+并在同一次执行中生成或修复全部缺失文件；第二次 execute_code（如确有必要）只能回读校验。
+已有证据足够时禁止重跑耗时模型，但不得臆造、手填或篡改指标。完成门禁修复后立即停止调用工具。
 """.strip()
     return f"""
 上一次输出未通过强制质量门禁：{error}
